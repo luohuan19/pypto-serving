@@ -9,7 +9,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -93,6 +97,16 @@ class _CompiledKernels:
     decode_block_table_buffer: torch.Tensor
     decode_slot_mapping_buffer: torch.Tensor
     decode_logits_buffer: torch.Tensor
+    # Torch reference prefill (pypto-lib prefill_fwd.golden_qwen3_14b_prefill). Used
+    # only by the optional CPU-prefill path; returns the post-chunk (k_cache, v_cache)
+    # in the kernel's paged BF16 layout and fills the logits buffer in-place.
+    cpu_prefill_golden: Any = None
+    # Pre-fork SHARED-memory staging buffer for host->device KV writes. The L3 chip
+    # worker is forked and can only read host memory inherited at fork, so a freshly
+    # allocated source buffer is invisible to it (copy_to -> 107017). KV pages are
+    # staged through this buffer (sized to one row's largest coalesced page run) and
+    # then copy_to'd. None unless prefill_on_cpu was set at compile time.
+    cpu_prefill_stage: torch.Tensor = None
 
 
 @dataclass
@@ -156,6 +170,8 @@ class Qwen314BModelRunner(ModelRunner):
         self,
         *,
         compiled: _CompiledKernels,
+        prefill_on_cpu: bool = False,
+        cpu_prefill_cache_dir: str | None = None,
     ) -> None:
         super().__init__()
         self._compiled = compiled
@@ -163,6 +179,22 @@ class Qwen314BModelRunner(ModelRunner):
         self._l3_static_tensors: dict[tuple[int, tuple[int, ...], torch.dtype], object] = {}
         self._static_args: _StaticKernelArgs | None = None
         self._pending_kv_cache_specs: dict[str, tuple[ModelConfig, RuntimeConfig]] = {}
+        # CPU-prefill path: compute the prompt KV (+ first-token logits) on host with
+        # the torch reference, then push the KV into the device pool the decode kernel
+        # reads. Sidesteps the NPU prefill kernel's ring-arena OOM at 40 layers / long
+        # context. Env override allows toggling without re-plumbing executor_kwargs.
+        self._prefill_on_cpu = prefill_on_cpu or os.environ.get(
+            "PYPTO_QWEN3_PREFILL_ON_CPU", ""
+        ).lower() in ("1", "true", "yes")
+        # Per-model host KV shadow ([cache_rows, head_dim] BF16, full pool shape) so
+        # chunked CPU prefill accumulates prior windows' KV before the device push.
+        self._cpu_kv_shadow: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Optional on-disk reuse of CPU-prefill results: caches the LOGICAL
+        # (position-major, page-independent) KV + first-token logits per unique
+        # prompt, so a rerun skips the minutes-long host loop. Keyed by token ids +
+        # model dims, so it is robust to a different physical page assignment.
+        cache_dir = cpu_prefill_cache_dir or os.environ.get("PYPTO_QWEN3_PREFILL_CACHE_DIR")
+        self._cpu_prefill_cache_dir = Path(cache_dir) if cache_dir else None
         if compiled is not None:
             self._share_static_kernel_tensors()
             self._static_args = self._build_static_kernel_args()
@@ -275,7 +307,14 @@ class Qwen314BModelRunner(ModelRunner):
         return self._static_args
 
     def run_prefill(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
-        """Run the JIT all-layer prefill kernel and return next-token logits."""
+        """Run all-layer prefill and return next-token logits.
+
+        Dispatches to the NPU prefill kernel by default, or to the host torch
+        reference when ``prefill_on_cpu`` is set (writes the resulting KV into the
+        same device pool the decode kernel reads, so decode is unchanged).
+        """
+        if self._prefill_on_cpu:
+            return self._run_prefill_cpu(model, batch)
         compiled = self._compiled
         prefill_inputs = self._prepare_prefill_inputs(model, batch)
 
@@ -298,6 +337,456 @@ class Qwen314BModelRunner(ModelRunner):
             last_hidden=None,
             logits=logits_padded[: prefill_inputs.actual_batch, : model.config.vocab_size],
         )
+
+    def _run_prefill_cpu(self, model: RuntimeModel, batch: PrefillBatch) -> PrefillResult:
+        """Compute prefill on host and push the prompt KV into the device pool.
+
+        Reuses ``prefill_fwd.golden_qwen3_14b_prefill`` (the torch reference that
+        mirrors the NPU prefill kernel's precision path) over the SAME packed
+        inputs, weights and RoPE tables the kernel would use. The reference returns
+        the post-chunk paged KV (BF16, identical row layout to the kernel), which we
+        copy into ``key_pages`` / ``value_pages`` — the device-resident pool the
+        decode kernel reads via ``block_table`` / ``slot_mapping``. No NPU prefill
+        dispatch, so the 40-layer ring-arena OOM never arises.
+        """
+        compiled = self._compiled
+        if compiled.cpu_prefill_golden is None:
+            raise RuntimeError(
+                "prefill_on_cpu is set but no cpu_prefill_golden was compiled in; "
+                "the executor must pass prefill_fwd.golden_qwen3_14b_prefill."
+            )
+        prefill_inputs = self._prepare_prefill_inputs(model, batch)
+        kv_cache = self._materialize_kv_cache(model)
+        k_dev = kv_cache.key_pages
+        v_dev = kv_cache.value_pages
+        self._validate_kv_cache_bounds(model, prefill_inputs.block_table, prefill_inputs.slot_mapping, k_dev)
+
+        out_buf = compiled.prefill_logits_buffer
+        if self._cpu_prefill_load_all(model, batch, prefill_inputs, k_dev, v_dev, out_buf):
+            self._mark_prefill_tokens_used(batch)
+            return PrefillResult(
+                last_hidden=None,
+                logits=out_buf[: prefill_inputs.actual_batch, : model.config.vocab_size],
+            )
+
+        k_host, v_host = self._get_cpu_kv_shadow(model.config.model_id, k_dev, v_dev)
+        weights = compiled.decode_weights
+        tensors = {
+            "hidden_states": prefill_inputs.hidden,
+            "seq_lens": prefill_inputs.seq_lens,
+            "chunk_lens": prefill_inputs.chunk_lens,
+            "chunk_offsets": prefill_inputs.chunk_offsets,
+            "input_rms_weight": weights["decode_input_rms_weight"],
+            "wq": weights["decode_wq"],
+            "wk": weights["decode_wk"],
+            "wv": weights["decode_wv"],
+            "q_norm_weight": weights["decode_q_norm_weight"],
+            "k_norm_weight": weights["decode_k_norm_weight"],
+            "rope_cos": compiled.rope_cos,
+            "rope_sin": compiled.rope_sin,
+            "block_table": prefill_inputs.block_table,
+            "slot_mapping": prefill_inputs.slot_mapping,
+            "k_cache": k_host,
+            "v_cache": v_host,
+            "wo": weights["decode_wo"],
+            "post_rms_weight": weights["decode_post_rms_weight"],
+            "w_gate": weights["decode_w_gate"],
+            "w_up": weights["decode_w_up"],
+            "w_down": weights["decode_w_down"],
+            "final_norm_weight": compiled.final_norm_weight,
+            "lm_head_weight": compiled.padded_lm_head_weight,
+            "out": out_buf,
+        }
+
+        with profile_span("Qwen314BModelRunner.cpu_prefill_golden", cat="executor"):
+            # The reference clones k_cache/v_cache internally, so the shadow is not
+            # mutated in place; rebind it to the returned (accumulated) caches so a
+            # later chunk for the same prompt attends over prior windows' KV.
+            k_new, v_new = compiled.cpu_prefill_golden(
+                tensors, progress=self._make_cpu_prefill_progress()
+            )
+        self._cpu_kv_shadow[model.config.model_id] = (k_new, v_new)
+
+        with profile_span("Qwen314BModelRunner.cpu_prefill_kv_push", cat="executor"):
+            self._push_kv_pages_to_device(model, batch, prefill_inputs, k_new, v_new, k_dev, v_dev)
+
+        self._cpu_prefill_save_all(model, batch, prefill_inputs, k_new, v_new, out_buf)
+        self._mark_prefill_tokens_used(batch)
+        return PrefillResult(
+            last_hidden=None,
+            logits=out_buf[: prefill_inputs.actual_batch, : model.config.vocab_size],
+        )
+
+    @staticmethod
+    def _mark_prefill_tokens_used(batch: PrefillBatch) -> None:
+        """Advance each allocation's used-token count to its post-prefill length."""
+        for batch_idx, alloc in enumerate(batch.kv_allocations):
+            seq_len = int(batch.seq_lens[batch_idx].item())
+            alloc.tokens_used = max(alloc.tokens_used, seq_len)
+
+    @staticmethod
+    def _row_page_ids(batch: PrefillBatch, batch_idx: int) -> list[int]:
+        """Return the KV page ids backing one batch row (alloc or explicit blocks)."""
+        if batch_idx < len(batch.kv_allocations) and batch.kv_allocations[batch_idx] is not None:
+            return batch.kv_allocations[batch_idx].page_ids
+        if batch_idx < len(batch.block_ids):
+            return batch.block_ids[batch_idx]
+        return []
+
+    def _cpu_prefill_cache_key(self, model: RuntimeModel, token_ids_row: torch.Tensor, seq_len: int) -> str:
+        """Content hash identifying a prompt's CPU-prefill result.
+
+        Covers the prompt tokens plus every model dim that changes the KV/logits,
+        so a stale cache from a different model / shape can never be mis-applied.
+        """
+        cfg = model.config
+        header = (
+            f"{cfg.model_id}|{seq_len}|{cfg.num_hidden_layers}|{cfg.num_key_value_heads}|"
+            f"{cfg.head_dim}|{cfg.hidden_size}|{getattr(cfg, 'rope_theta', 0.0)}|"
+            f"{self._compiled.padded_vocab}"
+        )
+        h = hashlib.sha1(header.encode())
+        h.update(token_ids_row[:seq_len].to(torch.int64).cpu().contiguous().numpy().tobytes())
+        return h.hexdigest()
+
+    def _cpu_prefill_load_all(
+        self,
+        model: RuntimeModel,
+        batch: PrefillBatch,
+        prefill_inputs: _PrefillInputs,
+        k_dev: DeviceTensor,
+        v_dev: DeviceTensor,
+        out_buf: torch.Tensor,
+    ) -> bool:
+        """Serve the whole batch from disk if every row is a cache hit.
+
+        Only full-prompt rows (chunk == whole sequence) are cacheable, since the
+        saved logical KV must cover the full prefix [0, seq_len). Returns True iff
+        all active rows were loaded (KV scattered to device, logits filled).
+        """
+        if self._cpu_prefill_cache_dir is None:
+            return False
+        entries = []
+        for batch_idx in range(prefill_inputs.actual_batch):
+            seq_len = int(prefill_inputs.seq_lens[batch_idx].item())
+            chunk_len = int(prefill_inputs.chunk_lens[batch_idx].item())
+            if chunk_len != seq_len:
+                return False
+            key = self._cpu_prefill_cache_key(model, batch.token_ids[batch_idx], seq_len)
+            path = self._cpu_prefill_cache_dir / f"{key}.pt"
+            if not path.is_file():
+                return False
+            entries.append((batch_idx, seq_len, path))
+
+        # Rebuild each row's pages in the host pool from the logical cache, then
+        # copy just those pages to the device (same coalesced fast path as a fresh
+        # compute's push — only the request's own pages are touched).
+        k_host, v_host = self._get_cpu_kv_shadow(model.config.model_id, k_dev, v_dev)
+        worker = self._shared_l3_worker()
+        vocab = model.config.vocab_size
+        for batch_idx, seq_len, path in entries:
+            data = torch.load(path, map_location="cpu")
+            out_buf[batch_idx, :vocab] = data["logits"][:vocab]
+            page_ids = self._row_page_ids(batch, batch_idx)
+            self._scatter_logical_to_host(k_host, data["k"], page_ids, seq_len, model)
+            self._scatter_logical_to_host(v_host, data["v"], page_ids, seq_len, model)
+            self._copy_row_pages(worker, k_host, k_dev, page_ids, seq_len, model)
+            self._copy_row_pages(worker, v_host, v_dev, page_ids, seq_len, model)
+        print(
+            f"[cpu-prefill] cache HIT: {len(entries)} row(s) loaded from "
+            f"{self._cpu_prefill_cache_dir} (skipped host prefill)",
+            flush=True,
+        )
+        return True
+
+    def _cpu_prefill_save_all(
+        self,
+        model: RuntimeModel,
+        batch: PrefillBatch,
+        prefill_inputs: _PrefillInputs,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        out_buf: torch.Tensor,
+    ) -> None:
+        """Persist each full-prompt row's logical KV + logits for later reuse."""
+        if self._cpu_prefill_cache_dir is None:
+            return
+        self._cpu_prefill_cache_dir.mkdir(parents=True, exist_ok=True)
+        vocab = model.config.vocab_size
+        saved = 0
+        for batch_idx in range(prefill_inputs.actual_batch):
+            seq_len = int(prefill_inputs.seq_lens[batch_idx].item())
+            chunk_len = int(prefill_inputs.chunk_lens[batch_idx].item())
+            if chunk_len != seq_len:
+                continue
+            key = self._cpu_prefill_cache_key(model, batch.token_ids[batch_idx], seq_len)
+            path = self._cpu_prefill_cache_dir / f"{key}.pt"
+            if path.is_file():
+                continue
+            page_ids = self._row_page_ids(batch, batch_idx)
+            payload = {
+                "seq_len": seq_len,
+                "k": self._gather_logical_from_pool(k_pool, page_ids, seq_len, model),
+                "v": self._gather_logical_from_pool(v_pool, page_ids, seq_len, model),
+                "logits": out_buf[batch_idx, :vocab].clone(),
+            }
+            tmp = path.with_suffix(".pt.tmp")
+            torch.save(payload, tmp)
+            tmp.rename(path)  # atomic publish; a killed run never leaves a half file
+            saved += 1
+        if saved:
+            print(
+                f"[cpu-prefill] cache SAVE: {saved} new row(s) -> {self._cpu_prefill_cache_dir}",
+                flush=True,
+            )
+
+    def _gather_logical_from_pool(
+        self,
+        pool: torch.Tensor,
+        page_ids: list[int],
+        seq_len: int,
+        model: RuntimeModel,
+    ) -> torch.Tensor:
+        """Gather a row's paged KV into a [num_layers, seq_len, num_kv_heads, head_dim] tensor."""
+        page_size = model.runtime.page_size
+        num_kv_heads = model.config.num_key_value_heads
+        num_layers = model.config.num_hidden_layers
+        head_dim = model.config.head_dim
+        rows_per_layer = pool.shape[0] // num_layers
+        page_rows = num_kv_heads * page_size
+        out = torch.zeros((num_layers, seq_len, num_kv_heads, head_dim), dtype=pool.dtype)
+        for layer_idx in range(num_layers):
+            base = layer_idx * rows_per_layer
+            for page_pos, phys_page in enumerate(page_ids):
+                p0 = page_pos * page_size
+                if p0 >= seq_len:
+                    break
+                n = min(page_size, seq_len - p0)
+                block = pool[base + phys_page * page_rows : base + phys_page * page_rows + page_rows]
+                block = block.view(num_kv_heads, page_size, head_dim)
+                out[layer_idx, p0 : p0 + n] = block[:, :n, :].transpose(0, 1)
+        return out
+
+    def _scatter_logical_to_host(
+        self,
+        pool: torch.Tensor,
+        log: torch.Tensor,
+        page_ids: list[int],
+        seq_len: int,
+        model: RuntimeModel,
+    ) -> None:
+        """Scatter logical KV ([num_layers, seq_len, num_kv_heads, head_dim]) into a
+        host paged pool in place (inverse of ``_gather_logical_from_pool``).
+
+        Writes directly into the full host pool so the caller can bulk-upload it;
+        no per-page device copies.
+        """
+        page_size = model.runtime.page_size
+        num_kv_heads = model.config.num_key_value_heads
+        num_layers = model.config.num_hidden_layers
+        head_dim = model.config.head_dim
+        rows_per_layer = pool.shape[0] // num_layers
+        page_rows = num_kv_heads * page_size
+        for layer_idx in range(num_layers):
+            base = layer_idx * rows_per_layer
+            for page_pos, phys_page in enumerate(page_ids):
+                p0 = page_pos * page_size
+                if p0 >= seq_len:
+                    break
+                n = min(page_size, seq_len - p0)
+                block = pool[base + phys_page * page_rows : base + phys_page * page_rows + page_rows]
+                block = block.view(num_kv_heads, page_size, head_dim)
+                block[:, :n, :] = log[layer_idx, p0 : p0 + n].transpose(0, 1)
+
+    @staticmethod
+    def _make_cpu_prefill_progress():
+        """Return a throttled ``progress(done, total)`` callback for host prefill.
+
+        Emitted as plain log lines (not a TTY carriage-return bar) so it stays
+        readable in a redirected stress log: at most one line every few seconds,
+        plus a guaranteed final 100% line. ETA assumes roughly uniform per-step
+        cost (each step is one transformer layer over one batch row).
+        """
+        state = {"t0": time.perf_counter(), "last": -1.0}
+
+        def progress(done: int, total: int) -> None:
+            now = time.perf_counter()
+            if done < total and now - state["last"] < 5.0:
+                return
+            state["last"] = now
+            elapsed = now - state["t0"]
+            frac = (done / total) if total else 1.0
+            eta = (elapsed / frac - elapsed) if frac > 0 else 0.0
+            print(
+                f"[cpu-prefill] {done}/{total} layer-rows ({frac * 100:.0f}%) "
+                f"elapsed={elapsed:.0f}s eta={eta:.0f}s",
+                flush=True,
+            )
+
+        return progress
+
+    def _get_cpu_kv_shadow(
+        self,
+        model_id: str,
+        k_dev: DeviceTensor,
+        v_dev: DeviceTensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (lazily allocate) the host KV shadow matching the device pool.
+
+        Full-pool shape so the reference can index by absolute physical row exactly
+        as the kernel does. Allocated once per model and reused across requests;
+        stale rows from freed pages are never read (each request only attends over
+        positions it has written).
+        """
+        shadow = self._cpu_kv_shadow.get(model_id)
+        if shadow is None:
+            shape = tuple(k_dev.shape)
+            shadow = (
+                torch.zeros(shape, dtype=k_dev.dtype),
+                torch.zeros(tuple(v_dev.shape), dtype=v_dev.dtype),
+            )
+            self._cpu_kv_shadow[model_id] = shadow
+        return shadow
+
+    def _push_kv_pages_to_device(
+        self,
+        model: RuntimeModel,
+        batch: PrefillBatch,
+        prefill_inputs: _PrefillInputs,
+        k_host: torch.Tensor,
+        v_host: torch.Tensor,
+        k_dev: DeviceTensor,
+        v_dev: DeviceTensor,
+    ) -> None:
+        """Copy each request's KV pages from the host pool into the device pool.
+
+        Touches ONLY the rows backing this batch's pages (never clobbers another
+        request's live device KV). To avoid the tens-of-thousands of tiny
+        per-(page, layer) orchestrator round-trips that made this take hours, runs
+        of physically-consecutive pages are coalesced into one large ``copy_to``
+        per layer — so a contiguous allocation is just ``num_layers`` copies/row.
+        """
+        worker = self._shared_l3_worker()
+        for batch_idx in range(prefill_inputs.actual_batch):
+            if int(prefill_inputs.chunk_lens[batch_idx].item()) <= 0:
+                continue
+            seq_len = int(prefill_inputs.seq_lens[batch_idx].item())
+            page_ids = self._row_page_ids(batch, batch_idx)
+            self._copy_row_pages(worker, k_host, k_dev, page_ids, seq_len, model)
+            self._copy_row_pages(worker, v_host, v_dev, page_ids, seq_len, model)
+
+    def dump_request_kv(self, model: RuntimeModel, batch: PrefillBatch, path: str) -> None:
+        """Debug: read each request's prompt KV pages back from the device pool and
+        save logical [num_layers, seq_len, num_kv_heads, head_dim] K/V + token ids.
+
+        Call right after prefill (before decode appends new-token KV) to capture the
+        pure prompt KV. Used to compare CPU-prefill vs NPU-prefill KV numerically;
+        reads from the device in both cases so it is apples-to-apples.
+        """
+        kv = self._kv_caches.get(model.config.model_id)
+        if kv is None:
+            raise RuntimeError("dump_request_kv: KV cache not initialized")
+        stage = self._compiled.cpu_prefill_stage
+        if stage is None:
+            raise RuntimeError("dump_request_kv requires the pre-fork staging buffer (pass dump_kv at compile)")
+        k_dev, v_dev = kv.key_pages, kv.value_pages
+        worker = self._shared_l3_worker()
+        k_host = torch.zeros(tuple(k_dev.shape), dtype=k_dev.dtype)
+        v_host = torch.zeros(tuple(v_dev.shape), dtype=v_dev.dtype)
+        actual = len(batch.kv_allocations) if batch.kv_allocations else int(batch.seq_lens.shape[0])
+        payloads = []
+        for batch_idx in range(actual):
+            seq_len = int(batch.seq_lens[batch_idx].item())
+            page_ids = self._row_page_ids(batch, batch_idx)
+            self._read_pages_from_device(worker, k_dev, k_host, stage, page_ids, seq_len, model)
+            self._read_pages_from_device(worker, v_dev, v_host, stage, page_ids, seq_len, model)
+            payloads.append({
+                "seq_len": seq_len,
+                "token_ids": batch.token_ids[batch_idx][:seq_len].to(torch.int64).cpu().tolist(),
+                "k": self._gather_logical_from_pool(k_host, page_ids, seq_len, model),
+                "v": self._gather_logical_from_pool(v_host, page_ids, seq_len, model),
+            })
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(payloads, path)
+
+    def _read_pages_from_device(
+        self,
+        worker: Any,
+        dev: DeviceTensor,
+        host_pool: torch.Tensor,
+        stage: torch.Tensor,
+        page_ids: list[int],
+        seq_len: int,
+        model: RuntimeModel,
+    ) -> None:
+        """Read one request's [0, seq_len) KV pages (coalesced) from the device pool
+        into ``host_pool`` via the shared staging buffer (inverse of _copy_row_pages)."""
+        page_size = model.runtime.page_size
+        num_kv_heads = model.config.num_key_value_heads
+        num_layers = model.config.num_hidden_layers
+        rows_per_layer = dev.shape[0] // num_layers
+        page_rows = num_kv_heads * page_size
+        row_bytes = dev.shape[1] * torch.tensor([], dtype=dev.dtype).element_size()
+        num_pages = (seq_len + page_size - 1) // page_size
+        runs = self._coalesce_pages(page_ids, num_pages)
+        for layer_idx in range(num_layers):
+            base = layer_idx * rows_per_layer
+            for first_page, count in runs:
+                r0 = base + first_page * page_rows
+                nrows = count * page_rows
+                worker.copy_from(stage[:nrows].data_ptr(), dev.data_ptr + r0 * row_bytes, nrows * row_bytes)
+                host_pool[r0 : r0 + nrows].copy_(stage[:nrows])
+
+    @staticmethod
+    def _coalesce_pages(page_ids: list[int], num_pages: int) -> list[tuple[int, int]]:
+        """Group the first ``num_pages`` physical pages into (first_page, count) runs."""
+        pages = list(page_ids[:num_pages])
+        runs: list[tuple[int, int]] = []
+        i = 0
+        while i < len(pages):
+            j = i
+            while j + 1 < len(pages) and pages[j + 1] == pages[j] + 1:
+                j += 1
+            runs.append((pages[i], j - i + 1))
+            i = j + 1
+        return runs
+
+    def _copy_row_pages(
+        self,
+        worker: Any,
+        host_pool: torch.Tensor,
+        dev: DeviceTensor,
+        page_ids: list[int],
+        seq_len: int,
+        model: RuntimeModel,
+    ) -> None:
+        """Copy one request's [0, seq_len) KV pages (coalesced) into the device pool.
+
+        Each run is staged through the pre-fork shared buffer before copy_to: the
+        forked chip worker can only read host memory inherited at fork, so the
+        copy_to source MUST be that shared buffer, not a freshly sliced tensor.
+        """
+        stage = self._compiled.cpu_prefill_stage
+        if stage is None:
+            raise RuntimeError(
+                "cpu_prefill_stage is not allocated; prefill_on_cpu must be set when "
+                "the executor compiles the model (it allocates the pre-fork shared buffer)."
+            )
+        page_size = model.runtime.page_size
+        num_kv_heads = model.config.num_key_value_heads
+        num_layers = model.config.num_hidden_layers
+        rows_per_layer = dev.shape[0] // num_layers
+        page_rows = num_kv_heads * page_size
+        row_bytes = dev.shape[1] * torch.tensor([], dtype=dev.dtype).element_size()
+        num_pages = (seq_len + page_size - 1) // page_size
+        runs = self._coalesce_pages(page_ids, num_pages)
+        for layer_idx in range(num_layers):
+            base = layer_idx * rows_per_layer
+            for first_page, count in runs:
+                r0 = base + first_page * page_rows
+                nrows = count * page_rows
+                stage[:nrows].copy_(host_pool[r0 : r0 + nrows])
+                worker.copy_to(dev.data_ptr + r0 * row_bytes, stage[:nrows].data_ptr(), nrows * row_bytes)
 
     def run_decode(self, model: RuntimeModel, batch: DecodeBatch) -> DecodeResult:
         """Run the fused all-layer PAGED ``decode_layer.decode_fwd`` and return logits.

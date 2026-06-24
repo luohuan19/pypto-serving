@@ -64,6 +64,11 @@ class RuntimeConfig:
     total_kv_pages: int | None = None
     # Compile-time generation limit used by model-specific runners.
     max_new_tokens: int = 256
+    # Cap on prompt tokens processed per prefill dispatch. ``None`` prefills the
+    # whole prompt in one call; a positive value splits long prompts into
+    # contiguous windows so each dispatch's per-ring heap/task-window load stays
+    # bounded (the prefill kernel attends over prior chunks' KV via block_table).
+    prefill_chunk_size: int | None = None
 
 
 @dataclass(frozen=True)

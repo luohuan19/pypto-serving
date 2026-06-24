@@ -226,17 +226,35 @@ class LLMEngine:
                 return fast_path_result
 
             with self._executor.session():
-                prefill_result = self._executor.run_prefill(
-                    runtime_model,
-                    prefill_batch,
-                )
+                chunk_size = record.runtime.prefill_chunk_size
+                if chunk_size is not None and max_prompt_len > chunk_size:
+                    print(
+                        f"[prefill] chunked: max_prompt_len={max_prompt_len} "
+                        f"chunk_size={chunk_size}",
+                        flush=True,
+                    )
+                    prefill_logits = self._run_prefill_chunked(
+                        runtime_model,
+                        record,
+                        requests,
+                        token_tensor,
+                        embeddings,
+                        prompt_token_ids,
+                        allocations,
+                        chunk_size,
+                    )
+                else:
+                    prefill_logits = self._executor.run_prefill(
+                        runtime_model,
+                        prefill_batch,
+                    ).logits
 
                 sampling_params = self._sampler.from_generate_config(generate_config)
                 current_tokens = []
                 for batch_idx in range(len(requests)):
                     current_tokens.append(
                         self._sampler.sample(
-                            self._select_batch_row(prefill_result.logits, batch_idx),
+                            self._select_batch_row(prefill_logits, batch_idx),
                             sampling_params,
                         )
                     )
@@ -317,6 +335,82 @@ class LLMEngine:
             )
             for request_idx, request in enumerate(requests)
         ]
+
+    def _run_prefill_chunked(
+        self,
+        runtime_model,
+        record,
+        requests: list[RequestState],
+        token_tensor: torch.Tensor,
+        embeddings: torch.Tensor,
+        prompt_token_ids: list[list[int]],
+        allocations: list,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        """Prefill long prompts in contiguous windows to bound per-ring load.
+
+        Each window ``[s, s+chunk_size)`` is dispatched as its own
+        ``run_prefill`` over only the rows that still have prompt tokens left.
+        ``seq_lens`` carries the absolute length after the window, so the kernel
+        attends over the full ``[0, e)`` context via ``block_table`` (prior
+        windows' KV is already resident). A row's next-token logits are taken
+        from the window in which it ends (its last prompt token). Returns a
+        ``[batch, vocab]`` logits tensor in the original row order.
+        """
+        device = runtime_model.runtime.device
+        hidden_size = record.config.hidden_size
+        prompt_lens = [len(token_ids) for token_ids in prompt_token_ids]
+        max_prompt_len = max(prompt_lens)
+        final_logit_rows: list[torch.Tensor | None] = [None] * len(requests)
+
+        start = 0
+        while start < max_prompt_len:
+            window = min(chunk_size, max_prompt_len - start)
+            active = [idx for idx in range(len(requests)) if start < prompt_lens[idx]]
+            if not active:
+                break
+            print(
+                f"[prefill]   chunk window [{start}, {start + window}) "
+                f"active_rows={len(active)}",
+                flush=True,
+            )
+            chunk_lens = [min(window, prompt_lens[idx] - start) for idx in active]
+            cmax = max(chunk_lens)
+
+            tok = torch.zeros((len(active), cmax), dtype=torch.long, device=device)
+            emb = torch.zeros((len(active), cmax, hidden_size), dtype=embeddings.dtype, device=device)
+            positions = torch.full((len(active), cmax), -1, dtype=torch.int32, device=device)
+            seq_lens = torch.zeros(len(active), dtype=torch.int32, device=device)
+            for row, idx in enumerate(active):
+                clen = chunk_lens[row]
+                end = start + clen
+                tok[row, :clen] = token_tensor[idx, start:end]
+                emb[row, :clen, :] = embeddings[idx, start:end, :]
+                positions[row, :clen] = torch.arange(start, end, dtype=torch.int32, device=device)
+                seq_lens[row] = end
+
+            chunk_result = self._executor.run_prefill(
+                runtime_model,
+                PrefillBatch(
+                    request_ids=[requests[idx].request_id for idx in active],
+                    token_ids=tok,
+                    input_embeddings=emb,
+                    seq_lens=seq_lens,
+                    kv_allocations=[allocations[idx] for idx in active],
+                    positions=positions,
+                ),
+            )
+            # Capture logits for rows whose prompt ends in this window. Clone:
+            # the runner reuses its logits buffer across dispatches.
+            for row, idx in enumerate(active):
+                if start + chunk_lens[row] >= prompt_lens[idx]:
+                    final_logit_rows[idx] = self._select_batch_row(chunk_result.logits, row).clone()
+            start += window
+
+        missing = [idx for idx, logits in enumerate(final_logit_rows) if logits is None]
+        if missing:
+            raise RuntimeError(f"chunked prefill produced no logits for rows {missing}")
+        return torch.stack(final_logit_rows)  # type: ignore[arg-type]
 
     def _generate_stream(self, model_id: str, prompt: str, config: GenerateConfig) -> Iterator[str]:
         """Yield decoded text deltas for one streaming prompt."""

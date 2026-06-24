@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,6 +108,9 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         device_id: int = 0,
         save_kernels_dir: str | None = None,
         l3_trace: bool = False,
+        prefill_on_cpu: bool = False,
+        cpu_prefill_cache_dir: str | None = None,
+        dump_kv: bool = False,
     ) -> None:
         super().__init__(
             kv_cache_manager,
@@ -115,6 +119,16 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             save_kernels_dir=save_kernels_dir,
         )
         self._l3_trace = l3_trace
+        # When set, prefill runs on host (torch reference) and only its KV is pushed
+        # to the device pool; decode still runs the NPU kernel. Sidesteps the 40-layer
+        # prefill ring-arena OOM. Wire via EngineConfig.executor_kwargs={'prefill_on_cpu': True}.
+        self._prefill_on_cpu = prefill_on_cpu
+        # Optional dir to cache/reuse CPU-prefill results across runs (logical KV +
+        # first-token logits, keyed by prompt). Skips the host loop on a cache hit.
+        self._cpu_prefill_cache_dir = cpu_prefill_cache_dir
+        # Debug: read back prompt KV from the device pool after prefill (needs the
+        # pre-fork shared staging buffer even on the NPU-prefill path).
+        self._dump_kv = dump_kv
 
     @property
     def profile_verbose(self) -> bool:
@@ -127,6 +141,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             raise TypeError("Qwen314BPyptoExecutor requires Qwen3-14B compiled kernels.")
         return Qwen314BModelRunner(
             compiled=compiled,
+            prefill_on_cpu=self._prefill_on_cpu,
+            cpu_prefill_cache_dir=self._cpu_prefill_cache_dir,
         )
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
@@ -280,6 +296,29 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         decode_slot_mapping_buffer = torch.empty((kernel_batch,), dtype=torch.int32).share_memory_()
         _mark("decode_logits_buffer")
 
+        # Pre-fork shared staging buffer for the CPU-prefill KV push. Sized to one
+        # row's largest coalesced page run (= all of a sequence's pages in one go):
+        # max_blocks_per_seq * num_kv_heads * page_size rows. Allocated SHARED here,
+        # before init_kv_cache() forks the chip worker, so copy_to's source is
+        # readable by the forked child. Only needed when prefill runs on host.
+        cpu_prefill_stage = None
+        if self._prefill_on_cpu or self._dump_kv:
+            kv_dtype = getattr(torch, model.runtime.kv_dtype)
+            stage_rows = max_blocks_per_seq * model.config.num_key_value_heads * page_size
+            cpu_prefill_stage = torch.empty(
+                (stage_rows, model.config.head_dim), dtype=kv_dtype
+            ).share_memory_()
+
+        # CPU-prefill reference: vectorized by default (~2-3x+ faster, validated
+        # equivalent to the golden); PYPTO_QWEN3_PREFILL_EXACT=1 forces the slow
+        # per-token golden for debugging / bit-fidelity.
+        _exact = os.environ.get("PYPTO_QWEN3_PREFILL_EXACT", "").lower() in ("1", "true", "yes")
+        cpu_prefill_fn = (
+            qwen3_prefill_fwd.golden_qwen3_14b_prefill
+            if _exact
+            else qwen3_prefill_fwd.prefill_qwen3_14b_vectorized
+        )
+
         timer.report()
 
         return _CompiledKernels(
@@ -303,6 +342,8 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             decode_block_table_buffer=decode_block_table_buffer,
             decode_slot_mapping_buffer=decode_slot_mapping_buffer,
             decode_logits_buffer=decode_logits_buffer,
+            cpu_prefill_golden=cpu_prefill_fn,
+            cpu_prefill_stage=cpu_prefill_stage,
         )
 
     def _compile_prefill_fwd_callable(
