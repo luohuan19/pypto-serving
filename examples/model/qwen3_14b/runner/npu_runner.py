@@ -82,7 +82,6 @@ class _CompiledKernels:
     prefill: _L3Callable
     decode: _L3Callable
     greedy_sample: _L3Callable
-    token_embed: _L3Callable
     final_norm_weight: torch.Tensor
     rope_cos: torch.Tensor
     rope_sin: torch.Tensor
@@ -878,7 +877,6 @@ class Qwen314BModelRunner(ModelRunner):
                 self._compiled.prefill.compiled,
                 self._compiled.decode.compiled,
                 self._compiled.greedy_sample.compiled,
-                self._compiled.token_embed.compiled,
             ])
             self._l3_worker = worker
         return worker
